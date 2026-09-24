@@ -18,7 +18,7 @@ rewrites allocation sites using LLVM-BOLT to improve data locality.
 
 ## Measured performance
 
-Olden `health`, input `5 5000 4`. Measurements use `perf stat -r 3`.
+Olden `health`, input `5 5000 4`. Measurements use `perf stat -r N`.
 The baseline has no PreFix preallocation or BOLT transformation.
 
 | Metric | Baseline | PreFix | Reduction |
