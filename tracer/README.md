@@ -102,23 +102,21 @@ Change the output base with `make trace OUT=/path/to/base`. `make clean` removes
 all of these (the downloaded DynamoRIO in `tools/` survives until `make distclean`).
 
 
-void *calloc_wrapper(size_t num, size_t ele) {
-  current_calloc += 1;
 
-  if ((current_calloc == array[1][current_hds_counter_calloc].count) && ((num * ele) <= OFFSET_HDS)) {
-    current_hds_counter_calloc += 1;
+`void *calloc_wrapper(size_t num, size_t ele) {`
+    
+    current_calloc += 1;
 
-    void *ptr = (void *)array[1][current_hds_counter_calloc - 1].addr;
+    if ((current_calloc == array[1][current_hds_counter_calloc].count) && ((num * ele) <= OFFSET_HDS)) {
+      current_hds_counter_calloc += 1;
 
-    memset(ptr, 0, OFFSET_HDS);
+      void *ptr = (void *)array[1][current_hds_counter_calloc - 1].addr;
 
-    return ptr;
+      memset(ptr, 0, OFFSET_HDS);
 
-    // fprintf(stderr, "HDS buf: array[%d][%d].addr: %p, .count: %d\n", 1,
-    // current_hds_counter_calloc-1,
-    // array[1][current_hds_counter_calloc-1].addr,
-    // array[1][current_hds_counter_calloc-1].count);
-  }
+      return ptr;
+      
+    }
 
-  return calloc(num, ele);
-}
+    return calloc(num, ele);
+`}`
