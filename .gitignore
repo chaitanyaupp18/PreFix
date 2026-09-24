@@ -1,0 +1,6 @@
+prefix_run/
+__pycache__/
+*.pyc
+*.o
+run*.log
+.DS_Store

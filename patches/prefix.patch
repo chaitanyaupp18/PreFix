@@ -1,0 +1,456 @@
+diff --git a/bolt/include/bolt/Passes/BinaryPasses.h b/bolt/include/bolt/Passes/BinaryPasses.h
+index b5971d315d76..b704dee111de 100644
+--- a/bolt/include/bolt/Passes/BinaryPasses.h
++++ b/bolt/include/bolt/Passes/BinaryPasses.h
+@@ -19,9 +19,11 @@
+ #include "bolt/Profile/BoltAddressTranslation.h"
+ #include "llvm/Support/CommandLine.h"
+ #include <atomic>
++#include <map>
+ #include <set>
+ #include <string>
+ #include <unordered_set>
++#include <vector>
+ 
+ namespace llvm {
+ namespace bolt {
+@@ -512,6 +514,71 @@ enum FrameOptimizationType : char {
+   FOP_ALL   /// Perform FOP on all functions.
+ };
+ 
++//===--------------------------------------------------------------------===//
++//  PreFix custom passes (heap-layout project). See BinaryPasses.cpp for a full
++//  walkthrough of binary rewriting and the --replace-memalloc spec grammar.
++//===--------------------------------------------------------------------===//
++
++/// PreFix (WIP, study reference): would splice a wrapper's body into its call
++/// sites instead of `call <alloc>_wrapper`. Currently only locates/logs them;
++/// the project does the inlining with --force-inline. See BinaryPasses.cpp.
++class ReplaceWrapperWithInst : public BinaryFunctionPass {
++private:
++  std::vector<std::string> Spec;
++
++  // Wrapper base name parsed from a "<function>:<wrapper>" spec chunk.
++  StringRef getWrapSymbol(const BinaryFunction &) const;
++
++public:
++  explicit ReplaceWrapperWithInst(const cl::opt<bool> &PrintPass,
++                                  cl::list<std::string> &Spec)
++      : BinaryFunctionPass(PrintPass), Spec(Spec) {}
++
++  bool staticID(const BinaryFunction &BF) const;
++
++  const char *getName() const override { return "replace-wrapper"; }
++
++  Error runOnFunctions(BinaryContext &BC) override;
++};
++
++/// PreFix core pass: at the call sites named on --replace-memalloc, repoint the
++/// call from <allocator> to <allocator>_wrapper. See BinaryPasses.cpp for the
++/// spec grammar and a walkthrough of the rewrite.
++class ReplaceMemAlloc : public BinaryFunctionPass {
++private:
++  std::vector<std::string> Spec;
++
++  // Parse the spec chunk for a function into { allocator -> {site indices} }.
++  std::map<std::string, std::set<size_t>> getLocalID(const BinaryFunction &) const;
++
++public:
++  explicit ReplaceMemAlloc(const cl::opt<bool> &PrintPass,
++                           cl::list<std::string> &Spec)
++      : BinaryFunctionPass(PrintPass), Spec(Spec) {}
++
++  // True if this function is named in the spec (cheap pre-filter).
++  bool staticID(const BinaryFunction &BF) const;
++
++  const char *getName() const override { return "replace-memalloc"; }
++
++  Error runOnFunctions(BinaryContext &BC) override;
++};
++
++/// PreFix: repoint every free() call to free_wrapper (--replace-free).
++class ReplaceFree : public BinaryFunctionPass {
++private:
++  std::vector<std::string> Spec;
++
++public:
++  explicit ReplaceFree(const cl::opt<bool> &PrintPass,
++                       cl::list<std::string> &Spec)
++      : BinaryFunctionPass(PrintPass), Spec(Spec) {}
++
++  const char *getName() const override { return "replace-free"; }
++
++  Error runOnFunctions(BinaryContext &BC) override;
++};
++
+ } // namespace bolt
+ } // namespace llvm
+ 
+diff --git a/bolt/lib/Passes/BinaryPasses.cpp b/bolt/lib/Passes/BinaryPasses.cpp
+index 89737b906e82..a53c8e73364f 100644
+--- a/bolt/lib/Passes/BinaryPasses.cpp
++++ b/bolt/lib/Passes/BinaryPasses.cpp
+@@ -2083,5 +2083,312 @@ Error RemoveNops::runOnFunctions(BinaryContext &BC) {
+   return Error::success();
+ }
+ 
++//===----------------------------------------------------------------------===//
++//  PreFix custom passes — READ THIS FIRST (intro to binary rewriting in BOLT)
++//===----------------------------------------------------------------------===//
++//
++//  Goal (the "PreFix" heap-layout project)
++//  ---------------------------------------
++//  PreFix decides a custom heap layout offline. To make a program use it we link
++//  in a small C file that defines replacement allocators named  <alloc>_wrapper
++//  (e.g. xmalloc_wrapper). The wrappers hand out pre-placed addresses for the
++//  specific allocations PreFix cares about, and otherwise fall back to malloc.
++//
++//  `ReplaceMemAlloc` walks the *already-linked* binary and, at the EXACT call
++//  sites PreFix chose, changes the call target from the original allocator to its
++//  `_wrapper`. We touch only the (function, Nth-call-to-that-allocator) sites
++//  named on the command line — not every malloc.
++//
++//  What "binary rewriting" means here
++//  ----------------------------------
++//  A call like `xmalloc(64)` is one instruction `call xmalloc` whose operand is a
++//  *symbol reference* to `xmalloc`. "Rewriting the call site" = leave the
++//  instruction in place, point its operand at a different symbol
++//  (`xmalloc_wrapper`). That single operand swap is the heart of this pass.
++//
++//  BOLT objects (mental model)
++//  ---------------------------
++//    BinaryContext  BC     — the whole program (functions, symbols, MC layer).
++//    BinaryFunction        — one function = ordered list of BinaryBasicBlocks.
++//    BinaryBasicBlock      — a straight-line run of MCInsts.
++//    MCInst         Inst   — one machine instruction (e.g. a `call`).
++//    MCSymbol              — a named address (e.g. `xmalloc`).
++//    MCPlusBuilder  BC.MIB — target-aware helpers: isCall? target symbol? set it.
++//
++//  Spec grammar (value of --replace-memalloc=...) — a comma-separated list; each
++//  chunk is one FunctionSpec string:
++//      <mangled_function>:<site>:<site>:...:-<allocator>
++//  = "inside <function>, the listed 1-based calls to <allocator> (counting only
++//  calls to that allocator) become <allocator>_wrapper". Empty site list = all.
++//  Two allocators joinable with '|':  <fn>:<sites>:-<allocA>|<sites>:-<allocB>.
++//  Example: _Z27ira_init_register_move_cost12machine_mode:1:2:3:-xmalloc
++//
++//  NOTE: runOnFunctions returns llvm::Error in current BOLT, so each one ends
++//  (and early-exits) with `return Error::success();`.
++//===----------------------------------------------------------------------===//
++
++// staticID: cheap pre-filter — "is this one of the functions named in the spec?"
++bool ReplaceMemAlloc::staticID(const BinaryFunction &Function) const {
++  if (!BinaryFunctionPass::shouldOptimize(Function))
++    return false;
++
++  for (const std::string &FunctionSpec : Spec) {
++    // The function name is everything before the first ':' in a spec chunk.
++    StringRef FunctionName = StringRef(FunctionSpec).split(':').first;
++    // Match current and original (pre-BOLT) names; BOLT can rename functions.
++    if (Function.hasNameRegex(FunctionName) ||
++        Function.hasRestoredNameRegex(FunctionName)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// getLocalID: parse the spec chunk for THIS function into
++//     { allocator_name -> { call-site indices to rewrite } }.
++// For "fn:1:2:3:-xmalloc" this returns { "xmalloc" -> {1,2,3} }.
++std::map<std::string, std::set<size_t>>
++ReplaceMemAlloc::getLocalID(const BinaryFunction &Function) const {
++  StringRef WrapSymbol1 = "";   // first allocator name (e.g. "xmalloc")
++  StringRef WrapSymbol2 = "";   // second allocator name (only if '|' present)
++  StringRef dummy = "";
++  StringRef SitesString1;       // raw "1:2:3:" for the first allocator
++  StringRef SitesString2;
++  StringRef FunctionName;
++
++  // Find the spec chunk whose <function> matches this BinaryFunction, peeling it
++  // apart with successive splits:
++  //     <function> : <sites...> : - <allocator>  [ | <sites...> : - <alloc2> ]
++  for (const std::string &FunctionSpec : Spec) {
++    std::tie(WrapSymbol1, WrapSymbol2) = StringRef(FunctionSpec).split('|');
++    std::tie(FunctionName, WrapSymbol1) = StringRef(WrapSymbol1).split('-');
++    std::tie(FunctionName, SitesString1) = StringRef(FunctionName).split(':');
++
++    std::tie(SitesString2, WrapSymbol2) = StringRef(WrapSymbol2).split('-');
++    std::tie(dummy, SitesString2) = StringRef(SitesString2).split(':');
++
++    if (Function.hasNameRegex(FunctionName) ||
++        Function.hasRestoredNameRegex(FunctionName))
++      break; // found the chunk for this function; keep the parsed pieces
++
++    SitesString1 = "";
++    SitesString2 = "";
++    WrapSymbol1 = "";
++    WrapSymbol2 = "";
++  }
++
++  std::map<std::string, std::set<size_t>> myMap;
++
++  // Turn the raw "1:2:3:" text into a set of integers {1,2,3}.
++  std::set<size_t> Sites1;
++  SmallVector<StringRef, 5> SitesVec1;
++  SitesString1.split(SitesVec1, ':');
++  for (StringRef SiteString1 : SitesVec1) {
++    if (SiteString1.empty())
++      continue;
++    size_t Result1;
++    if (!SiteString1.getAsInteger(10, Result1)) // getAsInteger: false on success
++      Sites1.emplace(Result1);
++  }
++  myMap.emplace(WrapSymbol1, Sites1);
++
++  // Optional second allocator (rarely used; the project Makefile never uses '|').
++  if (WrapSymbol2 != "") {
++    std::set<size_t> Sites2;
++    SmallVector<StringRef, 5> SitesVec2;
++    SitesString2.split(SitesVec2, ':');
++    for (StringRef SiteString2 : SitesVec2) {
++      if (SiteString2.empty())
++        continue;
++      size_t Result2;
++      if (!SiteString2.getAsInteger(10, Result2))
++        Sites2.emplace(Result2);
++    }
++    myMap.emplace(WrapSymbol2, Sites2);
++  }
++
++  return myMap;
++}
++
++// runOnFunctions: the actual rewrite. For every targeted function, find the
++// chosen call sites and repoint each from <allocator> to <allocator>_wrapper.
++Error ReplaceMemAlloc::runOnFunctions(BinaryContext &BC) {
++  // These passes emit x86 symbol/PLT names; only run on x86 binaries.
++  if (!BC.isX86())
++    return Error::success();
++
++  outs() << "BOLT-INFO: Running Replace Mem Alloc\n";
++
++  for (auto &BFI : BC.getBinaryFunctions()) {
++    BinaryFunction &Function = BFI.second;
++
++    if (!staticID(Function)) // skip functions not named in the spec
++      continue;
++
++    std::map<std::string, std::set<size_t>> LocalIDs = getLocalID(Function);
++
++    // Snapshot the function's basic blocks (pbegin/pend = layout order).
++    std::vector<BinaryBasicBlock *> Blocks(Function.pbegin(), Function.pend());
++
++    // Handle each targeted allocator independently (e.g. xmalloc, then xcalloc).
++    for (const auto &pair : LocalIDs) {
++      const std::string &Allocator = pair.first;   // e.g. "xmalloc"
++      const std::set<size_t> &Sites = pair.second; // e.g. {1,2,3}
++
++      for (size_t element : Sites)
++        outs() << "Function: " << Function.getPrintName()
++               << ", Local IDs: " << element
++               << ", WrapSymbol: " << Allocator << "\n";
++
++      // Empty site set => rewrite all calls to this allocator.
++      auto shouldRewriteSite = [&](size_t N) {
++        return Sites.empty() || Sites.count(N);
++      };
++
++      // CallSiteID counts ONLY calls to `Allocator`, in layout order (1-based) —
++      // the "static call-site index" the spec refers to.
++      size_t CallSiteID = 0;
++
++      for (BinaryBasicBlock *CurBB : Blocks) {
++        for (auto II = CurBB->begin(); II != CurBB->end(); ++II) {
++          MCInst &Inst = *II;
++
++          // Only calls whose target is a symbol (operand 0 is an expression).
++          if (!BC.MIB->isCall(Inst) || !Inst.getOperand(0).isExpr())
++            continue;
++
++          // The symbol this call targets, e.g. "xmalloc" or "xmalloc@PLT".
++          const MCSymbol *CalleeSymbol = BC.MIB->getTargetSymbol(Inst);
++          if (CalleeSymbol->getName() != Allocator &&
++              CalleeSymbol->getName() != Allocator + "@PLT")
++            continue;
++
++          ++CallSiteID; // this is the next call to `Allocator`
++          if (!shouldRewriteSite(CallSiteID))
++            continue; // not a site PreFix selected — leave it alone
++
++          // Strip a trailing "@PLT", then build "<alloc>_wrapper".
++          std::string baseName = CalleeSymbol->getName().str();
++          size_t pos = baseName.find("@");
++          std::string wrapperName =
++              (pos != std::string::npos ? baseName.substr(0, pos) : baseName) +
++              "_wrapper";
++
++          // THE REWRITE: same `call` instruction, new destination symbol.
++          MCSymbol *WrapperSymbol =
++              BC.getOrCreateUndefinedGlobalSymbol(wrapperName);
++          BC.MIB->setOperandToSymbolRef(Inst, 0, WrapperSymbol, 0, &*BC.Ctx, 0);
++        }
++      }
++    }
++  }
++  return Error::success();
++}
++
++// ReplaceFree: repoint EVERY `free(...)` call to `free_wrapper`, so the wrapper
++// can refuse to free pointers that belong to the PreFix arena. Unconditional
++// (no per-site selection). Enabled via --replace-free.
++Error ReplaceFree::runOnFunctions(BinaryContext &BC) {
++  if (!BC.isX86())
++    return Error::success();
++  outs() << "BOLT-INFO: Running Replace Free\n";
++  for (auto &BFI : BC.getBinaryFunctions()) {
++    BinaryFunction &Function = BFI.second;
++
++    // Don't rewrite free() inside the wrapper itself / the allocator's freealloc.
++    if (Function.getPrintName() == "free_wrapper" ||
++        Function.getPrintName() == "freealloc")
++      continue;
++    std::vector<BinaryBasicBlock *> Blocks(Function.pbegin(), Function.pend());
++    for (BinaryBasicBlock *CurBB : Blocks) {
++      for (auto II = CurBB->begin(); II != CurBB->end(); ++II) {
++        MCInst &Inst = *II;
++        if (!BC.MIB->isCall(Inst) || !Inst.getOperand(0).isExpr())
++          continue;
++        const MCSymbol *CalleeSymbol = BC.MIB->getTargetSymbol(Inst);
++        if (CalleeSymbol->getName() != "free" &&
++            CalleeSymbol->getName() != "free@PLT")
++          continue;
++
++        MCSymbol *WrapperSymbol =
++            BC.getOrCreateUndefinedGlobalSymbol("free_wrapper");
++        BC.MIB->setOperandToSymbolRef(Inst, 0, WrapperSymbol, 0, &*BC.Ctx, 0);
++      }
++    }
++  }
++  return Error::success();
++}
++
++//===----------------------------------------------------------------------===//
++//  ReplaceWrapperWithInst — INCOMPLETE / WORK-IN-PROGRESS (study reference only)
++//  Would splice a wrapper's body into its call sites instead of leaving a
++//  `call <alloc>_wrapper`. Never finished: runOnFunctions only FINDS and LOGS
++//  the wrapper calls (the splice is a TODO). The project inlines with the
++//  existing --force-inline option instead.
++//===----------------------------------------------------------------------===//
++bool ReplaceWrapperWithInst::staticID(const BinaryFunction &Function) const {
++  if (!BinaryFunctionPass::shouldOptimize(Function))
++    return false;
++  for (const std::string &FunctionSpec : Spec) {
++    StringRef FunctionName = StringRef(FunctionSpec).split(':').first;
++    if (Function.hasNameRegex(FunctionName) ||
++        Function.hasRestoredNameRegex(FunctionName)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++StringRef
++ReplaceWrapperWithInst::getWrapSymbol(const BinaryFunction &Function) const {
++  StringRef WrapSymbol = "";
++  for (const std::string &FunctionSpec : Spec) {
++    StringRef FunctionName;
++    std::tie(FunctionName, WrapSymbol) = StringRef(FunctionSpec).split(':');
++    if (Function.hasNameRegex(FunctionName) ||
++        Function.hasRestoredNameRegex(FunctionName))
++      break;
++    WrapSymbol = "";
++  }
++  return WrapSymbol;
++}
++
++Error ReplaceWrapperWithInst::runOnFunctions(BinaryContext &BC) {
++  if (!BC.isX86())
++    return Error::success();
++
++  for (auto &BFI : BC.getBinaryFunctions()) {
++    BinaryFunction &Function = BFI.second;
++    if (!staticID(Function))
++      continue;
++
++    std::string WrapSymbol = (std::string)getWrapSymbol(Function);
++    outs() << "Function From ReplaceWrapperInst: " << Function.getPrintName()
++           << " WrapSymbol: " << WrapSymbol << "\n";
++
++    std::vector<BinaryBasicBlock *> Blocks(Function.pbegin(), Function.pend());
++    size_t CallSiteID = 0;
++    for (BinaryBasicBlock *CurBB : Blocks) {
++      for (auto II = CurBB->begin(); II != CurBB->end(); ++II) {
++        MCInst &Inst = *II;
++        if (!BC.MIB->isCall(Inst) || !Inst.getOperand(0).isExpr())
++          continue;
++        const MCSymbol *CalleeSymbol = BC.MIB->getTargetSymbol(Inst);
++        if (CalleeSymbol->getName() != WrapSymbol + "_wrapper")
++          continue;
++
++        ++CallSiteID;
++        outs() << "CalleeSymbol " << CalleeSymbol->getName() << ", " << CallSiteID
++               << "\n";
++        // TODO (unimplemented): inline the wrapper here instead of leaving the
++        // call: (1) find the wrapper's BinaryFunction, (2) copy its instructions
++        // into CurBB at this position, (3) erase this call. Today we rely on
++        // --force-inline instead.
++      }
++    }
++  }
++  return Error::success();
++}
++
+ } // namespace bolt
+ } // namespace llvm
+diff --git a/bolt/lib/Rewrite/BinaryPassManager.cpp b/bolt/lib/Rewrite/BinaryPassManager.cpp
+index 6e3022c491a7..31a117974b26 100644
+--- a/bolt/lib/Rewrite/BinaryPassManager.cpp
++++ b/bolt/lib/Rewrite/BinaryPassManager.cpp
+@@ -254,6 +254,25 @@ SpecializeMemcpy1("memcpy1-spec",
+   cl::value_desc("func1,func2:cs1:cs2,func3:cs1,..."),
+   cl::ZeroOrMore, cl::cat(BoltOptCategory));
+ 
++// PreFix heap-layout options (see bolt/lib/Passes/BinaryPasses.cpp).
++static cl::list<std::string> ReplaceWrapperWithInst(
++    "replace-wrapper",
++    cl::desc("list of functions with call sites for which to replace wrapper"),
++    cl::value_desc("func1,func2:cs1:cs2,func3:cs1,..."),
++    cl::ZeroOrMore, cl::cat(BoltOptCategory));
++
++static cl::list<std::string> ReplaceMemAlloc(
++    "replace-memalloc",
++    cl::desc("at the listed call sites, redirect the allocator to its _wrapper"),
++    cl::value_desc("func:cs1:cs2:-alloc,..."),
++    cl::ZeroOrMore, cl::cat(BoltOptCategory));
++
++static cl::list<std::string> ReplaceFree(
++    "replace-free",
++    cl::desc("redirect every free() call to free_wrapper"),
++    cl::value_desc("func1,func2,..."),
++    cl::ZeroOrMore, cl::cat(BoltOptCategory));
++
+ static cl::opt<bool> Stoke("stoke", cl::desc("turn on the stoke analysis"),
+                            cl::cat(BoltOptCategory));
+ 
+@@ -433,6 +452,20 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+       std::make_unique<SpecializeMemcpy1>(NeverPrint, opts::SpecializeMemcpy1),
+       !opts::SpecializeMemcpy1.empty());
+ 
++  // PreFix passes: gated on their option being non-empty (the standard idiom).
++  Manager.registerPass(
++      std::make_unique<ReplaceMemAlloc>(NeverPrint, opts::ReplaceMemAlloc),
++      !opts::ReplaceMemAlloc.empty());
++
++  Manager.registerPass(
++      std::make_unique<ReplaceWrapperWithInst>(NeverPrint,
++                                               opts::ReplaceWrapperWithInst),
++      !opts::ReplaceWrapperWithInst.empty());
++
++  Manager.registerPass(
++      std::make_unique<ReplaceFree>(NeverPrint, opts::ReplaceFree),
++      !opts::ReplaceFree.empty());
++
+   Manager.registerPass(std::make_unique<InlineMemcpy>(NeverPrint),
+                        opts::StringOps);
+ 
