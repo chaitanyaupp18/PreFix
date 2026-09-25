@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 #
-# PreFix — end-to-end heap layout optimization on one real benchmark.
+# PreFix — a reproduction of the paper's pipeline on ONE benchmark.
 #
-# Reproduces Figure 8 of the PreFix paper on **health** (Olden suite), a
-# pointer-chasing benchmark that allocates thousands of small linked structs —
-# exactly the workload PreFix targets. It is publicly redistributable (it ships
-# in llvm-test-suite with its own LICENSE.TXT), so this script can fetch it.
+# SCOPE: this is an independent reproduction of the PreFix pipeline (CGO '25,
+# doi 10.1145/3696443.3708960) on **health** from the Olden suite. It is NOT the
+# paper's artifact and does not cover the paper's other 12 benchmarks, its
+# object-recycling results, or its multithreading study. health is a
+# pointer-chasing benchmark that allocates millions of small linked structs --
+# the workload PreFix targets -- and is downloaded from a pinned
+# llvm-test-suite commit rather than vendored here.
 #
 #   Original Executable ─┬─> DynamoRIO ──> Mem. Access Trace ──> Trace Analysis
 #                        │                                            │
@@ -16,8 +19,8 @@
 #                                    v
 #                            Optimized Executable ──> perf / DrCacheSim stats
 #
-# Stages: (i) trace  (ii) HDS + hot-singleton layout  (iii) generate prefix.c
-#         (iv) apply the BOLT patch + rewrite  (v) measure with perf stat -r
+# Stages: DynamoRIO trace -> Trace Analysis (HDS & Hot Singleton objects)
+#         -> Gen. Prealloc Code -> BOLT Transformation -> perf stat -r
 #
 # Requires: Linux x86-64, git, cmake, ninja, cc, python3+numpy, curl, perf.
 # Everything lands in ./prefix_run — nothing is installed system-wide.
@@ -36,6 +39,9 @@ fi
 
 # ---- knobs (override from the environment) -----------------------------------
 LLVM_COMMIT=${LLVM_COMMIT:-94ae3dd241ad9f1d8cf11720fadd68b50236d4f9}
+# Pin the benchmark too, not just the compiler: llvm-test-suite/main moves, and
+# a changed health.c would silently change both the layout and the numbers.
+TESTSUITE_COMMIT=${TESTSUITE_COMMIT:-b93f949ca6c38da7cf2eea708b5a86a4a5c9f30b}
 DR_VERSION=${DR_VERSION:-10.0.0}
 JOBS=${JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 # health <max_level> <max_time> <seed>.
@@ -78,7 +84,7 @@ BENCH_HDRS=(health.h)
 BENCH_EXTRA=(LICENSE.TXT README.txt)
 BENCH_CFLAGS=(-O2 -g -DTORONTO)
 BENCH_LIBS=(-lm)
-RAW=https://raw.githubusercontent.com/llvm/llvm-test-suite/main/MultiSource/Benchmarks/Olden
+RAW=https://raw.githubusercontent.com/llvm/llvm-test-suite/${TESTSUITE_COMMIT}/MultiSource/Benchmarks/Olden
 
 banner() { printf '\n\033[1m==== %s ====\033[0m\n' "$*"; }
 PY=${PYTHON:-python3}
@@ -97,14 +103,51 @@ mkdir -p "$SRC_DIR" "$BENCH_DIR" "$GEN_DIR" "$DATA_DIR" "$RESULTS"
 echo "workspace: ${BASE_DIR}"
 
 # ---- 1. fetch + build the benchmark (the "Original Executable") --------------
-banner "1. benchmark: health (Olden)"
+# health is NOT vendored in this repository. It is downloaded from a PINNED
+# llvm-test-suite commit, together with Olden's LICENSE.TXT, and every file is
+# checked against a recorded SHA-256 so the reproduction cannot drift.
+banner "1. benchmark: health (Olden @ ${TESTSUITE_COMMIT:0:12})"
+
+# sha256  filename  (from llvm-test-suite @ $TESTSUITE_COMMIT)
+BENCH_SHA256="\
+d548685cbf528584092ec93dd365b05f8832d772e2f1466279ca6064e3b92d4e  health.c
+7c094fc24ba506b042b4e17059afda87087019ea4cfa9aea509ae7b0faf8027b  args.c
+261e08675ffc5f2c7d14c3cdd60dde158d588a0b04ccc3273157677bf1300342  list.c
+995621b7cef718d158c558bc0f91efde78b3021e33070435202f54331f803a05  poisson.c
+f3b2bf0d162d978ed3ab98dcc2358806409419233bac58388b94a233fcb32d74  health.h
+7817a8d0ff663a9e68df2556c59f15af9d06f9ecf16fb216a4489a236bc2221a  LICENSE.TXT
+ab682333f84a3d0aa57215ca0aa8e1699fbd830421e412e88b6f003316db9b23  README.txt"
+
+SHACMD=$(command -v sha256sum || command -v shasum || true)
+verify_sha() {   # $1 = filename (basename, as listed above)
+  local want got
+  want=$(printf '%s\n' "$BENCH_SHA256" | awk -v f="$1" '$2==f {print $1}')
+  [[ -n "$want" ]] || { echo "FAIL: no recorded checksum for $1"; exit 1; }
+  [[ -n "$SHACMD" ]] || return 0          # no sha tool: pin still applies
+  case "$SHACMD" in
+    *shasum) got=$("$SHACMD" -a 256 "${BENCH_DIR}/$1" | cut -d" " -f1) ;;
+    *)       got=$("$SHACMD" "${BENCH_DIR}/$1" | cut -d" " -f1) ;;
+  esac
+  if [[ "$got" != "$want" ]]; then
+    echo "FAIL: checksum mismatch for $1"
+    echo "  expected ${want}"
+    echo "  got      ${got}"
+    echo "  source   ${RAW}"
+    rm -f "${BENCH_DIR}/$1"
+    exit 1
+  fi
+}
+
 for f in "${BENCH_SRCS[@]}" "${BENCH_HDRS[@]}"; do
   [[ -f "${BENCH_DIR}/${f}" ]] || curl -fsSL -o "${BENCH_DIR}/${f}" "${RAW}/health/${f}"
+  verify_sha "$f"
 done
 # LICENSE.TXT / README.txt live at the Olden suite root, not in health/
 for f in "${BENCH_EXTRA[@]}"; do
   [[ -f "${BENCH_DIR}/${f}" ]] || curl -fsSL -o "${BENCH_DIR}/${f}" "${RAW}/${f}"
+  verify_sha "$f"
 done
+echo "benchmark sources verified against recorded SHA-256"
 if [[ ! -x "$BIN_BASE" ]]; then
   # -Wl,-q keeps relocations in the binary, which BOLT requires.
   ( cd "$BENCH_DIR" && "$CC" "${BENCH_CFLAGS[@]}" -Wl,-q \
@@ -179,23 +222,56 @@ echo "optimized binary: $BIN_OPT"
 if command -v objdump >/dev/null; then
   VERIFY_ARGS=()
   for a in "${BOLT_ARGS[@]}"; do [[ "$a" == --force-inline=* ]] || VERIFY_ARGS+=("$a"); done
-  "$BOLT" "$BIN_LINKED" "${VERIFY_ARGS[@]}" -o "${BASE_DIR}/.verify.bolt" >/dev/null 2>&1 || true
+  vrc=0
+  "$BOLT" "$BIN_LINKED" "${VERIFY_ARGS[@]}" -o "${BASE_DIR}/.verify.bolt" \
+        >/dev/null 2>&1 || vrc=$?
+  if [[ $vrc -ne 0 ]]; then
+    echo "FAIL: verification rewrite failed (llvm-bolt exit ${vrc}) — see ${RESULTS}/bolt.log"
+    rm -f "${BASE_DIR}/.verify.bolt"; exit 1
+  fi
   n=$(objdump -d "${BASE_DIR}/.verify.bolt" 2>/dev/null | grep -cE 'call.*_wrapper' || true)
   rm -f "${BASE_DIR}/.verify.bolt"
   echo "redirected call sites (verified without --force-inline): $n"
-  [[ "$n" -gt 0 ]] || echo "WARNING: BOLT redirected nothing — see ${RESULTS}/bolt.log"
+  if [[ "$n" -eq 0 ]]; then
+    # Nothing was transformed, so the "optimized" binary is just the linked one.
+    # Benchmarking it would report a speedup of ~1.0 and mean nothing.
+    echo "FAIL: BOLT redirected no call sites — see ${RESULTS}/bolt.log"
+    exit 1
+  fi
 fi
 
 # ---- 5c. correctness: optimized output must match the baseline ---------------
+# This is a hard gate. A heap-layout transformation that changes program output,
+# or that produces a binary which crashes, is wrong -- and timing a wrong binary
+# would report a meaningless speedup (a program that dies early is very fast).
+# Any failure here stops the script before stage 6.
 banner "5c. correctness check"
-"$BIN_BASE" "${BENCH_ARGS[@]}" > "${RESULTS}/out.baseline"  2>&1 || true
-"$BIN_OPT"  "${BENCH_ARGS[@]}" > "${RESULTS}/out.optimized" 2>&1 || true
-if diff -q "${RESULTS}/out.baseline" "${RESULTS}/out.optimized" >/dev/null; then
-  echo "output identical to the baseline — OK"
-else
-  echo "WARNING: output differs from the baseline!"
+
+run_checked() {   # $1 = binary, $2 = output file, $3 = label
+  local rc=0
+  "$1" "${BENCH_ARGS[@]}" > "$2" 2>&1 || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "FAIL: $3 exited with status ${rc} on: $(basename "$1") ${BENCH_ARGS[*]}"
+    echo "--- last 20 lines of its output ---"
+    tail -20 "$2"
+    exit 1
+  fi
+}
+
+run_checked "$BIN_BASE" "${RESULTS}/out.baseline"  "baseline"
+run_checked "$BIN_OPT"  "${RESULTS}/out.optimized" "optimized"
+
+if ! diff -q "${RESULTS}/out.baseline" "${RESULTS}/out.optimized" >/dev/null; then
+  echo "FAIL: optimized output differs from the baseline."
+  echo "--- diff (baseline vs optimized, first 20 lines) ---"
   diff "${RESULTS}/out.baseline" "${RESULTS}/out.optimized" | head -20 || true
+  echo "---"
+  echo "Refusing to benchmark an incorrect binary. Full outputs:"
+  echo "  ${RESULTS}/out.baseline"
+  echo "  ${RESULTS}/out.optimized"
+  exit 1
 fi
+echo "output identical to the baseline — OK"
 
 # ---- 6. (v) measure ----------------------------------------------------------
 # Headline comparison: PRISTINE binary (no prefix.c, no BOLT) vs the PreFix
