@@ -49,8 +49,10 @@ The first run builds LLVM-BOLT from source.
 - **LLVM/BOLT revision:** `94ae3dd241ad9f1d8cf11720fadd68b50236d4f9` —
   the revision `patches/prefix.patch` was developed and verified against.
 - **Benchmark:** Olden `health`, downloaded from `llvm-test-suite` at
-  `b93f949ca6c38da7cf2eea708b5a86a4a5c9f30b`. Each downloaded file is
-  verified against a recorded SHA-256.
+  `b93f949ca6c38da7cf2eea708b5a86a4a5c9f30b`
+  ([sources](https://github.com/llvm/llvm-test-suite/tree/b93f949ca6c38da7cf2eea708b5a86a4a5c9f30b/MultiSource/Benchmarks/Olden/health),
+  [health.c](https://github.com/llvm/llvm-test-suite/blob/b93f949ca6c38da7cf2eea708b5a86a4a5c9f30b/MultiSource/Benchmarks/Olden/health/health.c)).
+  Each downloaded file is verified against a recorded SHA-256.
 - **Profiling input:** `5 500 4`; **measurement input:** `5 5000 4`.
 
 For a quick analysis and code-generation check:
