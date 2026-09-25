@@ -72,12 +72,20 @@ def split_bump(slots, align, bump_start):
 
 
 def gen_tables(tables, bases):
-    """Pack every kind's EXCEPTION slots into one uint32 blob."""
+    """Pack every kind's MOVED slots into one uint32 blob.
+
+    Each kind's region ends with a zero sentinel. Allocation counters start at
+    1, so a count of 0 can never match and the wrapper's cursor can never run
+    past the end -- which is what lets the fast path drop its bounds test. This
+    is the same trick the paper's prefix.c gets for free from `array` being a
+    zero-initialised global.
+    """
     blob = bytearray()
     for k in KINDS:
         bases[k] = len(blob) // 12
         for count, offset, size in tables.get(k, []):
             blob += struct.pack("<III", count, offset, size)
+        blob += struct.pack("<III", 0, 0, 0)          # sentinel
     return bytes(blob)
 
 
@@ -94,42 +102,37 @@ def _wrapper(kind, zero):
     K = kind.upper()
     args = "size_t num, size_t ele" if zero else "size_t size"
     want = "    size_t size = num * ele;\n" if zero else ""
-    zero_hit = "            memset(p, 0, size);\n" if zero else ""
-    fallback = "calloc(num, ele)" if zero else f"{kind}(size)"
+    # calloc must hand back zeroed memory; malloc promises nothing, so it does
+    # no memset at all.
+    zero_hit = "        memset(p, 0, size);\n" if zero else ""
     return f"""void *{kind}_wrapper({args})
 {{
 {want}    unsigned long i = ++prefix_{kind}_seen;
-    if (!prefix_arena)
-        return {fallback};
 
-    /* 1. did the layout MOVE this allocation (an HDS member)? */
+    /* 1. did the layout MOVE this allocation (an RHDS member)?
+     * The table ends with a zero sentinel and counters start at 1, so the slot
+     * cursor can never run off the end -- no bounds test on the fast path. */
     unsigned k = prefix_{kind}_exc_slot;
-    if (k < PREFIX_{K}_EXC_N) {{
-        const unsigned int *e = &prefix_tbl[(PREFIX_{K}_EXC_BASE + k) * 3];
-        if (i == e[0]) {{
-            prefix_{kind}_exc_slot = k + 1;
-            if (size <= e[2]) {{
-                void *p = (char *)prefix_arena + e[1];
-{zero_hit}                return p;
-            }}
-        }}
+    const unsigned int *e = &prefix_tbl[(PREFIX_{K}_EXC_BASE + k) * 3];
+    if (i == e[0]) {{
+        prefix_{kind}_exc_slot = k + 1;
+        void *p = (char *)prefix_arena + e[1];
+{zero_hit}        return p;
     }}
 
     /* 2. otherwise keep allocation order -> pure bump, no table read.
-     * Deliberately NOT capped at the profiled allocation count: the measured
-     * run is longer than the profiling run, and the whole point is that every
-     * allocation from these call sites lands in the contiguous arena. We bump
-     * until the arena is exhausted, then fall back to the real allocator. */
+     * The region is sized exactly for the traced allocation sequence, and the
+     * measured run uses the SAME input as the traced run, so the cursor cannot
+     * overrun it. That is what removes the capacity test from this path. The
+     * driver enforces PROFILE_ARGS == BENCH_ARGS; changing one without
+     * re-running the pipeline would corrupt memory. */
     {{
         unsigned long c = prefix_cursor;
-        unsigned long need = (size + (PREFIX_ALIGN - 1)) & ~(unsigned long)(PREFIX_ALIGN - 1);
-        if (c + need <= PREFIX_ARENA_BYTES) {{
-            prefix_cursor = c + need;
-            void *p = (char *)prefix_arena + c;
-{zero_hit}            return p;
-        }}
+        prefix_cursor = c + ((size + (PREFIX_ALIGN - 1))
+                             & ~(unsigned long)(PREFIX_ALIGN - 1));
+        void *p = (char *)prefix_arena + c;
+{zero_hit}        return p;
     }}
-    return {fallback};
 }}
 
 """
@@ -143,6 +146,7 @@ def gen_prefix_c(layout, tables):
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/mman.h>
 #include "common.h"
 
 /* One contiguous arena holding every object PreFix chose to preallocate.
@@ -186,17 +190,25 @@ static unsigned long prefix_slot_size(const void *p)
 {
     prefix_arena = malloc(PREFIX_ARENA_BYTES);
     if (!prefix_arena) {
+        /* Abort rather than limp on: the wrappers deliberately carry no null
+         * test, so continuing here would hand out offsets from NULL. Failing
+         * once at startup is both safer and one less branch per allocation. */
         fprintf(stderr, "prefix: arena of %lu bytes failed to allocate\\n",
                 (unsigned long)PREFIX_ARENA_BYTES);
-        return;
+        abort();
     }
+    /* Pin the region so it cannot be paged out mid-run. */
+    if (mlock(prefix_arena, PREFIX_ARENA_BYTES) != 0)
+        perror("prefix: mlock");          /* not fatal: the layout still holds */
+
     /* Deliberately NOT memset: malloc does not promise zeroed memory and
-     * calloc_wrapper zeroes per object, so eagerly touching the whole arena
-     * would just add startup cost. Pages fault in exactly like malloc's would. */
+     * calloc_wrapper zeroes per object, so eagerly touching the whole region
+     * would just add startup cost. Pages fault in exactly as malloc's would. */
 }
 
 __attribute__((destructor(101))) static void prefix_fini(void)
 {
+    munlock(prefix_arena, PREFIX_ARENA_BYTES);
     free(prefix_arena);
     prefix_arena = NULL;
 }

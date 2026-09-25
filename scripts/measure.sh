@@ -82,6 +82,7 @@ shift 3
 ARGS=("$@")
 
 OUTDIR=${OUTDIR:-$(mktemp -d)}
+mkdir -p "$OUTDIR"        # an OUTDIR passed in from outside may not exist yet
 BASE_TXT=${OUTDIR}/perf_baseline.txt
 OPT_TXT=${OUTDIR}/perf_optimized.txt
 

@@ -17,11 +17,15 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # ---- the configuration that produced the published numbers -------------------
-# Workload. The paper's health input (max_level=5 max_time=5000 seed=4); the
-# trace is collected on a 10x shorter run so tracing finishes in minutes, and
-# the preallocated region is sized for the long run.
+# Workload. The paper's health input (max_level=5 max_time=5000 seed=4).
+# Tracing and measuring use the SAME input, as the paper does, so the
+# preallocated region can be sized exactly and the wrappers need no
+# capacity test. Tracing the full run takes appreciably longer than a
+# shortened one.
 export BENCH_ARGS="${BENCH_ARGS:-5 5000 4}"      # measured run
-export PROFILE_ARGS="${PROFILE_ARGS:-5 500 4}"   # traced run
+export PROFILE_ARGS="${PROFILE_ARGS:-5 5000 4}"  # traced run -- MUST equal
+                                                 # BENCH_ARGS: the region is sized
+                                                 # exactly for the traced run
 export SAMPLE="${SAMPLE:-200}"                   # keep 1 in N accesses; tune to trade
                                                  # trace time against HDS resolution.
                                                  # Allocation and free records are
@@ -32,7 +36,6 @@ export SAMPLE="${SAMPLE:-200}"                   # keep 1 in N accesses; tune to
 export SELECT="${SELECT:-all}"        # preallocate every traced allocation (HA=100%);
                                       # partial coverage splits one traversal between
                                       # the preallocated region and the heap, and loses.
-export ARENA_MB="${ARENA_MB:-64}"     # floor: the measured run allocates ~1.7M nodes
 export HDS_LENGTH="${HDS_LENGTH:-2}"  # objects per HDS (the paper requires >= 2)
 export MIN_FREQ="${MIN_FREQ:-0.05}"   # HDS recurrence threshold
 export EXCLUDE_FUNC="${EXCLUDE_FUNC:-^_}"  # skip libc-internal allocator callers

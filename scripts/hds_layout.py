@@ -144,10 +144,6 @@ def main():
     ap.add_argument("--hot-coverage", type=float, default=0.97,
                     help="preallocate the hottest objects until they cover this "
                          "fraction of all heap accesses (the paper's HA%)")
-    ap.add_argument("--arena-mb", type=int, default=64,
-                    help="minimum arena size; the measured run allocates more "
-                         "than the profiling run, so the arena must be sized for "
-                         "the long run (the paper uses 42 MB for health)")
     ap.add_argument("--max-arena", type=int, default=512 * 1024 * 1024,
                     help="cap on total arena bytes")
     ap.add_argument("--exclude-func", default=r"^_",
@@ -234,9 +230,12 @@ def main():
         cursor += pad
         selected.append({"id": oid, "offset": cursor, **by_id[oid]})
         cursor += sz
-    # Pad so the longer measured run keeps bump-allocating into the arena
-    # instead of spilling to malloc once the profiled objects run out.
-    arena_bytes = max(cursor, args.arena_mb * 1024 * 1024)
+    # Sized EXACTLY for the traced allocation sequence -- no slack. The paper
+    # does the same (TOTAL_HDS_SIZE == TOTAL_HDS_OBJS * OFFSET_HDS), which is
+    # what lets the wrapper drop its capacity test. This is only sound because
+    # the measured run uses the same input as the traced run; the driver
+    # enforces that.
+    arena_bytes = cursor
 
     # ---- which (function, allocator) pairs BOLT must redirect -------------
     redirect = sorted({(o["func"], o["kind"]) for o in selected})

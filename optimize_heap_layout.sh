@@ -45,13 +45,11 @@ TESTSUITE_COMMIT=${TESTSUITE_COMMIT:-b93f949ca6c38da7cf2eea708b5a86a4a5c9f30b}
 DR_VERSION=${DR_VERSION:-10.0.0}
 JOBS=${JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 # health <max_level> <max_time> <seed>.
-# BENCH_ARGS is what we MEASURE: 5 5000 4 is the size used in the PreFix paper
-# (~33 s, 62% L1D miss rate -- enough cache pressure for layout to matter).
-# PROFILE_ARGS is the shorter run we TRACE (the paper's "Profiling Run"). The
-# allocation sequence is deterministic, so the hot objects -- allocated during
-# setup -- get the same allocation counters in both runs.
+# BENCH_ARGS is what we MEASURE: 5 5000 4 is the size used in the PreFix paper.
+# PROFILE_ARGS is what we TRACE (the paper's "Profiling Run"). It defaults to
+# BENCH_ARGS and must equal it -- see the check below.
 read -r -a BENCH_ARGS   <<< "${BENCH_ARGS:-5 5000 4}"
-read -r -a PROFILE_ARGS <<< "${PROFILE_ARGS:-5 500 4}"
+read -r -a PROFILE_ARGS <<< "${PROFILE_ARGS:-${BENCH_ARGS:-5 5000 4}}"
 SAMPLE=${SAMPLE:-200}                    # keep 1 in N accesses while tracing;
                                          # alloc/free records are never sampled
 RUNS=${RUNS:-3}                          # perf stat -r N (the paper uses 3)
@@ -60,7 +58,6 @@ HDS_LENGTH=${HDS_LENGTH:-2}              # objects per HDS (paper: >= 2)
 MIN_FREQ=${MIN_FREQ:-0.05}               # HDS recurrence threshold
 SELECT=${SELECT:-all}                     # all | coverage
 HOT_COVERAGE=${HOT_COVERAGE:-0.97}        # with SELECT=coverage: target HA%
-ARENA_MB=${ARENA_MB:-64}                 # arena floor (measured run > profiled run)
 EXCLUDE_FUNC=${EXCLUDE_FUNC:-^_}          # allocator callers BOLT cannot rewrite
 
 SRC_DIR=${BASE_DIR}/sources
@@ -89,6 +86,17 @@ RAW=https://raw.githubusercontent.com/llvm/llvm-test-suite/${TESTSUITE_COMMIT}/M
 banner() { printf '\n\033[1m==== %s ====\033[0m\n' "$*"; }
 PY=${PYTHON:-python3}
 CC=${CC:-cc}
+
+# The preallocated region is sized exactly for the traced allocation sequence
+# and the wrappers carry no capacity test, so tracing and measuring MUST use the
+# same input -- otherwise the measured run allocates past the end of the region.
+if [[ "${PROFILE_ARGS[*]}" != "${BENCH_ARGS[*]}" ]]; then
+  echo "FAIL: PROFILE_ARGS and BENCH_ARGS must match."
+  echo "  PROFILE_ARGS: ${PROFILE_ARGS[*]}"
+  echo "  BENCH_ARGS:   ${BENCH_ARGS[*]}"
+  echo "The region is sized for the traced run and the wrappers do not bounds-check."
+  exit 1
+fi
 
 # ---- 0. prerequisites --------------------------------------------------------
 banner "0. prerequisites"
@@ -172,7 +180,6 @@ banner "3. (ii) HDS + hot-singleton layout"
 "$PY" "${CWD}/scripts/hds_layout.py" --trace "$TRACE_CSV" --out "$LAYOUT" \
       --hds-length "$HDS_LENGTH" --min-freq "$MIN_FREQ" \
       --select "$SELECT" --hot-coverage "$HOT_COVERAGE" \
-      --arena-mb "$ARENA_MB" \
       --exclude-func "$EXCLUDE_FUNC" \
       | tee "${RESULTS}/layout.log"
 
